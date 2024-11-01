@@ -1,9 +1,9 @@
 //--------------------------------------------------
 //! \file     sketche_GarageDoor.ino
 //! \brief    Sketch pour le JeeNode : gestion d'une porte de garage motorisee
-//! \brief 	Les messages reçus ont ce format:  $GARL,xxxx
-//! \brief 	xxx = CLOSE -> consigne pour FERMER la porte de garage
-//! \brief 	xxx = OPEN -> consigne pour OUVRIR la porte de garage
+//! \brief 	Les messages reçus ont ce format:  $GARL,x
+//! \brief 	x = 0 -> consigne pour FERMER la porte de garage
+//! \brief 	x = 1 -> consigne pour OUVRIR la porte de garage
 //! \date     2024-10
 //! \author   minbiocabanon
 //--------------------------------------------------
@@ -37,8 +37,11 @@ char stNum[] = "GARL";
 #define CMD_VMCDF 7 // Commande Bypass vers Ext sur PD7 - Pin13
 #define INFO_PC 17  // Commande Bypass vers Ext sur PC4 - Pin27
 #define INFO_EXT 26 // FAUX			// Commande Bypass vers Ext sur PC3 - Pin26
+#define CLOSE 0
+#define OPEN 1
 
-#define RELAY 16 // Commande Relais qui ouvrer/ferme la porte de garage sur PC2 - Pin25
+
+#define RELAY 4 // Commande Relais qui ouvrer/ferme la porte de garage sur PD4 - Pin6
 
 enum state_machine_t
 {
@@ -71,8 +74,6 @@ unsigned long TimeOutMoteur = 0;
 boolean bFlagMoteurPosOK = false;
 int nblipled;
 
-int consigne_bypass, consigne_VMC;
-
 // flag
 boolean bTimeToSendRadioMsg = false;
 boolean bflag_consigne_en_attente = false;
@@ -80,9 +81,10 @@ boolean bflag_consigne_en_attente = false;
 // chaine pour l'émission RF12
 char buffer_recept_rf12[66] = "";
 
-int consigne_prec = 0; // Position courante du Bypass
-
+//Variables specifiques porte de garage
 const int LED = 6; // PD6 - pin12 - DIO Port 3
+int nconsigne_porte = NULL;
+bool bretinfoporte = OPEN; // on met OPEN par défaut, ainsi, si le serveur voit que la porte est ouverte par défaut, il renverra une consigne CLOSE pour forcer la fermeture
 
 //----------------------------------------------------------------------
 //!\brief           fait clignoter la led une fois
@@ -164,7 +166,7 @@ void SendRadioData(void)
 
   // conversion du float en INT x100
 
-  sprintf(payload, "$%s,%04d,%04d,%04d,%04d\r\n", stNum, 0, 0, 0, 0);
+  sprintf(payload, "$%s,%i\r\n", stNum, bretinfoporte);
 
   // **************************************************
   // *	Emission des infos  sur la radio
@@ -212,9 +214,8 @@ int TrtReceptRadio(void)
     // DEBUG
     Serial.println("\n Message recu");
     Serial.print(buffer_recept_rf12);
-    Serial.println("<");
     // on verifie que l'entet du message est la bonne, en théorie c'est toujours le cas si on utilise les ID radio
-    if (buffer_recept_rf12[1] == 'B' && buffer_recept_rf12[2] == 'P' && buffer_recept_rf12[3] == 'C')
+    if (buffer_recept_rf12[1] == 'G' && buffer_recept_rf12[2] == 'A' && buffer_recept_rf12[3] == 'R' && buffer_recept_rf12[4] == 'L')
     {
       // on affiche le message reçu
       // Serial.println(buffer_recept_rf12);
@@ -236,62 +237,19 @@ int TrtReceptRadio(void)
   return (RetVal);
 }
 
+
 //----------------------------------------------------------------------
-//!\brief          Positionne la bypass
-//!\param[in]    	consigne en %
+//!\brief          Genere une impulsion sur la sortie relais qui pilote la carte moteur de la porte de garage
+//!\param[in]    	duree : duree de l'impulsion en millisecondes
 //----------------------------------------------------------------------
-void SetBypass(int consigne_bypass)
+void impulsion_relais(int duree)
 {
-  // DEBUG
-  Serial.print("on applique la consigne Bypass : ");
-  Serial.println(consigne_bypass);
+  // on active le relay qui pilote la porte de garage
+  digitalWrite(RELAY, HIGH);
+  delay(duree);
+  // on desactive le relay qui pilote la porte de garage
+  digitalWrite(RELAY, LOW);
 
-  int delta = consigne_prec - consigne_bypass;
-
-  if (consigne_bypass > 95)
-  {
-    digitalWrite(CMD_EXT, HIGH);
-    digitalWrite(CMD_PC, LOW);
-  }
-  else if (consigne_bypass < 5)
-  {
-    digitalWrite(CMD_EXT, LOW);
-    digitalWrite(CMD_PC, HIGH);
-  }
-  else
-  {
-    if (delta >= 0)
-    {
-      digitalWrite(CMD_EXT, HIGH);
-      digitalWrite(CMD_PC, LOW);
-    }
-    else
-    {
-      digitalWrite(CMD_EXT, LOW);
-      digitalWrite(CMD_PC, HIGH);
-    }
-
-    // On lance un timer de la durée nécessaire pour positionner le registre
-    // on charge le compteur du timer moteur avec la valeur
-    TicksMoteur = TIME_0_TO_100 * abs(delta) / 100; // (x10 car basé sur Timer100ms)
-
-    Serial.print("Timer lance (s): ");
-    Serial.println(TicksMoteur);
-    // on memorise la consigne courante
-    consigne_prec = consigne_bypass;
-  }
-}
-
-//----------------------------------------------------------------------
-//!\brief          Allume ou éteind la VMC
-//!\param[in]    	consigne ON/OFF
-//----------------------------------------------------------------------
-void SetVMC(int consigne_VMC)
-{
-  // DEBUG
-  Serial.print("on applique la consigne VMC : ");
-  Serial.println(consigne_VMC);
-  digitalWrite(CMD_VMCDF, consigne_VMC); // on applique la consigne
 }
 
 //----------------------------------------------------------------------
@@ -304,8 +262,7 @@ int Trt_msg_GAR(char *message)
   char *entete, *i;
   // on dépouille le message reçu
   entete = strtok_r(message, ",", &i);
-  consigne_bypass = atoi(strtok_r(NULL, ",", &i));
-  consigne_VMC = atoi(strtok_r(NULL, ",", &i));
+  nconsigne_porte = atoi(strtok_r(NULL, ",", &i));
 
   return (1);
 }
@@ -343,51 +300,60 @@ void tache_gestion_SM(void)
     break;
 
   case SM_INIT:
-    // compare char with start character
-    if (false)
-    {
-
-      /* change SM to header comparison */
+    // rien a initialiser ???
       SM_state = SM_WAIT;
-    }
     break;
 
   case SM_WAIT:
-    // On a recu une consigne d'ouverture/fermeture
-    if (bflag_consigne_en_attente == true)
+    if (TrtReceptRadio() == 1)
     {
-
-      // ici extraire la consigne
-
+      // on execute la consigne du message recu
+      Trt_msg_GAR(buffer_recept_rf12);
       // on passe a l'etat suivant
       SM_state = SM_ACTION;
+      // on fait clignoter la led pour le debug
+      clignote_led();
     }
+
     break;
 
   case SM_ACTION:
 
-    // si consigne ouverte
-    // regarder si porte n'est pas deja ouverte
-    // agir sur GPIO
-    // attendre quelques secondes que l'aimant s'eloigne du capteur
-    // armer timeout
-    // on passe a l'etat suivant
-    SM_state = SM_WAIT_OPEN;
+    if( nconsigne_porte == OPEN)
+    {
+      // si consigne ouverte
+      // regarder si porte n'est pas deja ouverte
+      // on genere un impulsion sur le relais qui pilote la porte de garage
+      impulsion_relais(1000);
+      // attendre quelques secondes que l'aimant s'eloigne du capteur
+      delay(2000);
+      // attendre quelques secondes que l'aimant s'eloigne du capteur
+      // armer timeout
+      // on passe a l'etat suivant
+      SM_state = SM_WAIT_OPEN;
+    }
 
-    // si consigne fermeture
-    // regarder si porte n'est pas deja ouverte
-    // agir sur GPIO
-    // attendre quelques secondes que l'aimant s'eloigne du capteur
-    // armer timeout
-    // on passe a l'etat suivant
-    SM_state = SM_WAIT_CLOSE;
-
+    if( nconsigne_porte == CLOSE)
+    {
+      // si consigne fermeture
+      // regarder si porte n'est pas deja ouverte
+      // agir sur GPIO
+      // on genere un impulsion sur le relais qui pilote la porte de garage
+      impulsion_relais(1000);
+      // attendre quelques secondes que l'aimant s'eloigne du capteur
+      delay(2000);
+      // armer timeout
+      // on passe a l'etat suivant
+      SM_state = SM_WAIT_CLOSE;
+    }
     break;
 
   case SM_WAIT_CLOSE:
     // capteur fin de course CLOSE = true ?
     // si oui
     //  preparer buffer avec etat CLOSE
+    bretinfoporte = CLOSE;
+    SM_state = SM_SEND_RADIO;
 
     break;
 
@@ -395,6 +361,8 @@ void tache_gestion_SM(void)
     // capteur fin de course OPEN = true ?
     // si oui
     //  preparer buffer avec etat OPEN
+    bretinfoporte = OPEN;
+    SM_state = SM_SEND_RADIO;
     break;
 
   case SM_ERROR:
@@ -404,6 +372,8 @@ void tache_gestion_SM(void)
     break;
 
   case SM_SEND_RADIO:
+    SendRadioData();
+    SM_state = SM_WAIT;
     break;
 
   default:
@@ -411,21 +381,6 @@ void tache_gestion_SM(void)
     // return to initial state of SM
     SM_state = SM_INIT;
     break;
-  }
-}
-
-void tache_gestion_consignes(void)
-{
-
-  // si une consigne est en attente de traitement
-  if (bflag_consigne_en_attente == true)
-  {
-    // on execute la consigne pour le bypass
-    SetBypass(consigne_bypass);
-    // on arme un TimeOut au cas ou un des moteurs reste bloqué (si le timer expire on arrête les deux moteurs)
-    TimeOutMoteur = TIMEOUTMOTEUR_SEC;
-    // on indique qu'on a traité la consigne
-    bflag_consigne_en_attente = false;
   }
 }
 
@@ -451,67 +406,68 @@ void status(void)
 //----------------------------------------------------------------------
 //!\brief           scheduler()
 //----------------------------------------------------------------------
-void Scheduler() {
+void tache_scheduler()
+{
 
-	if( (millis() - taskGetGPS) > PERIOD_GET_GPS){
-		taskGetGPS = millis();
-		MyFlag.taskGetGPS = true;	
-	}
+// 	if( (millis() - taskGetGPS) > PERIOD_GET_GPS){
+// 		taskGetGPS = millis();
+// 		MyFlag.taskGetGPS = true;	
+// 	}
 	
-	if( (millis() - taskTestGeof) > PERIOD_TEST_GEOFENCING){
-		taskTestGeof = millis();
-		MyFlag.taskTestGeof = true;
-	}
+// 	if( (millis() - taskTestGeof) > PERIOD_TEST_GEOFENCING){
+// 		taskTestGeof = millis();
+// 		MyFlag.taskTestGeof = true;
+// 	}
 	
-	if( (millis() - taskGetLiPo) > PERIOD_LIPO_INFO){
-		taskGetLiPo = millis();
-		MyFlag.taskGetLiPo = true;
-	}	
+// 	if( (millis() - taskGetLiPo) > PERIOD_LIPO_INFO){
+// 		taskGetLiPo = millis();
+// 		MyFlag.taskGetLiPo = true;
+// 	}	
 	
-	if( (millis() - taskCheckSMS) > PERIOD_CHECK_SMS){
-		taskCheckSMS = millis();
-		MyFlag.taskCheckSMS = true;
-	}
+// 	if( (millis() - taskCheckSMS) > PERIOD_CHECK_SMS){
+// 		taskCheckSMS = millis();
+// 		MyFlag.taskCheckSMS = true;
+// 	}
 	
-	if( (millis() - taskAutoTestSMS) > PERIOD_AUTOTEST_SMS){
-		taskAutoTestSMS = millis();
-		SM_autotestsm = SMAT_START;
-	}	
+// 	if( (millis() - taskAutoTestSMS) > PERIOD_AUTOTEST_SMS){
+// 		taskAutoTestSMS = millis();
+// 		SM_autotestsm = SMAT_START;
+// 	}	
 	
-	if( (millis() - taskCheckFlood) > PERIOD_CHECK_FLOOD){
-		taskCheckFlood = millis();
-		MyFlag.taskCheckFlood = true;
-	}	
+// 	if( (millis() - taskCheckFlood) > PERIOD_CHECK_FLOOD){
+// 		taskCheckFlood = millis();
+// 		MyFlag.taskCheckFlood = true;
+// 	}	
 	
-	if( (millis() - taskStatusSMS) > PERIODIC_STATUS_SMS){
-		taskStatusSMS = millis();
-		MyFlag.taskStatusSMS = true;
-	}
+// 	if( (millis() - taskStatusSMS) > PERIODIC_STATUS_SMS){
+// 		taskStatusSMS = millis();
+// 		MyFlag.taskStatusSMS = true;
+// 	}
 
-	if( (millis() - taskGetAnalog) > PERIOD_READ_ANALOG){
-		taskGetAnalog = millis();
-		MyFlag.taskGetAnalog = true;
-	}	
+// 	if( (millis() - taskGetAnalog) > PERIOD_READ_ANALOG){
+// 		taskGetAnalog = millis();
+// 		MyFlag.taskGetAnalog = true;
+// 	}	
 
-	if( (millis() - taskCheckInputVoltage) > PERIOD_CHECK_ANALOG_LEVEL){
-		taskCheckInputVoltage = millis();
-		MyFlag.taskCheckInputVoltage = true;
-	}
+// 	if( (millis() - taskCheckInputVoltage) > PERIOD_CHECK_ANALOG_LEVEL){
+// 		taskCheckInputVoltage = millis();
+// 		MyFlag.taskCheckInputVoltage = true;
+// 	}
 
-	if( ((millis() - TimeOutAutotestSMS) > TIMEOUT_AUTOTEST_SMS) && SM_autotestsm != SMAT_NOPE ){
-		Serial.println("--- Autotest SMS : Timeout , NO SMS received !! ---");
-		SM_autotestsm = SMAT_ERROR;
-	}
+// 	if( ((millis() - TimeOutAutotestSMS) > TIMEOUT_AUTOTEST_SMS) && SM_autotestsm != SMAT_NOPE ){
+// 		Serial.println("--- Autotest SMS : Timeout , NO SMS received !! ---");
+// 		SM_autotestsm = SMAT_ERROR;
+// 	}
 	
-	if( ((millis() - IntervalAutotestSMS) > INTERVAL_AUTOTEST_SMS) && SM_autotestsm == SMAT_RETRYSMS ){
-		Serial.println("--- Autotest SMS : Interval autotest SMS expired ---");
-		MyFlag.flagIntervalAutotestSMS = true;
-	}
+// 	if( ((millis() - IntervalAutotestSMS) > INTERVAL_AUTOTEST_SMS) && SM_autotestsm == SMAT_RETRYSMS ){
+// 		Serial.println("--- Autotest SMS : Interval autotest SMS expired ---");
+// 		MyFlag.flagIntervalAutotestSMS = true;
+// 	}
 	
-	if( ((millis() - TimeOutSMSMenu) > TIMEOUT_SMS_MENU) && MySMS.menupos != SM_LOGIN && MySMS.menupos != SM_AUTOTEST_SMS ){
-		MySMS.menupos = SM_LOGIN;
-		Serial.println("--- SMS Menu manager : Timeout ---");
-	}
+// 	if( ((millis() - TimeOutSMSMenu) > TIMEOUT_SMS_MENU) && MySMS.menupos != SM_LOGIN && MySMS.menupos != SM_AUTOTEST_SMS ){
+// 		MySMS.menupos = SM_LOGIN;
+// 		Serial.println("--- SMS Menu manager : Timeout ---");
+// 	}
 }
 
 //----------------------------------------------------------------------
@@ -562,7 +518,7 @@ void setup()
 void loop()
 {
 
-  tache_gestion_radio();
+  tache_scheduler();
 
   tache_gestion_SM();
 
