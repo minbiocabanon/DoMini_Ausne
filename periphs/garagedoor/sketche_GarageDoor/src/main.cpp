@@ -16,9 +16,6 @@
 #define version "JeeNode GarageDoor L"
 char stNum[] = "GARL";
 
-#define NBMINUTEVEILLE 300 * 10  // x10 car basé sur Timer100ms
-#define TIME_0_TO_100 2 * 10     // Nb de seconde (x10 car basé sur Timer100ms)  que mets le registre à parcourir la totalité de sa course
-#define TIMEOUTMOTEUR_SEC 5 * 10 // Nb de seconde (x10 car basé sur Timer100ms) pour le TimeOut à partir duquel on stoppe automatiquement les moteurs
 #define NB_BLIP_LED 500          // nb de cycle à attendre entr 2 clignotements de la led status
 
 // Mode radio
@@ -40,6 +37,8 @@ char stNum[] = "GARL";
 #define CLOSE 0
 #define OPEN 1
 
+// Declaration des durées des timers / timeout
+#define TIMEOUT_DOOR_MOVE			30000		// 30sec in milliseconds. A expiration, la machine d'état vérifie l'état de la porte
 
 #define RELAY 4 // Commande Relais qui ouvrer/ferme la porte de garage sur PD4 - Pin6
 
@@ -55,36 +54,49 @@ enum state_machine_t
   SM_SEND_RADIO
 } SM_state;
 
+enum door_state
+{
+  DOOR_CLOSED,
+  DOOR_OPENED,
+  DOOR_CLOSING,
+  DOOR_OPENING,
+  DOOR_ERROR,
+  DOOR_UNKNOWN_STATE
+} Door_State;
+
+
 // prototype fonctions
 void tache_gestion_radio(void);
 void setup(void);
 int Trt_msg_GAR(char *message);
-void SetVMC(int consigne_VMC);
 void Timer100ms(void);
-void CaptureSensor(void);
 void SendRadioData(void);
 int TrtReceptRadio(void);
-void SetBypass(int consigne_bypass);
 void clignote_led(void);
+void tache_scheduler();
+void tache_gestion_SM(void);
+void status();
+door_state get_door_state(void);
+void manage_door();
 
 // variable pour timer
-unsigned long TicksMsgRad = 0;
-unsigned long TicksMoteur = 0;
-unsigned long TimeOutMoteur = 0;
-boolean bFlagMoteurPosOK = false;
+unsigned long TimeOutDoorMove = 0;
 int nblipled;
 
 // flag
 boolean bTimeToSendRadioMsg = false;
 boolean bflag_consigne_en_attente = false;
+boolean bflag_Timeout_door_expired = true;
 
 // chaine pour l'émission RF12
 char buffer_recept_rf12[66] = "";
 
 //Variables specifiques porte de garage
 const int LED = 6; // PD6 - pin12 - DIO Port 3
-int nconsigne_porte = NULL;
-bool bretinfoporte = OPEN; // on met OPEN par défaut, ainsi, si le serveur voit que la porte est ouverte par défaut, il renverra une consigne CLOSE pour forcer la fermeture
+int nconsigne_porte = -1;
+boolean bFlagMoteurPosOK = false;
+door_state nretinfoporte = DOOR_OPENED; // on met DOOR_OPENED par défaut, ainsi, si le serveur voit que la porte est ouverte par défaut, il renverra une consigne CLOSE pour forcer la fermeture
+int ncpt_impulsion = 0;  // compteur du nombre d'impulsions envoyées pour mettre la porte de garage dans l'état demandé par la consigne
 
 //----------------------------------------------------------------------
 //!\brief           fait clignoter la led une fois
@@ -100,55 +112,10 @@ void clignote_led(void)
     delay(50);
     // eteint la led
     digitalWrite(LED, HIGH);
-
     delay(100);
   }
 }
 
-//----------------------------------------------------------------------
-//!\brief		Timer 100 milliseconde
-//!\return		-
-//----------------------------------------------------------------------
-void Timer100ms(void)
-{
-
-  // si le timer moteur est lancé
-  if (TicksMoteur != 0)
-  {
-    // on décrémente le compteur
-    TicksMoteur--;
-    // debug
-    Serial.println(TicksMoteur);
-    // Si le timer a expiré, on a du atteindre la position
-    if (TicksMoteur == 0)
-      bFlagMoteurPosOK = true;
-  }
-
-  // on incrémente le compteur de ticks
-  TicksMsgRad++;
-  // Si le timer a expiré, on set le flag pour envoyer un message radio
-  if (TicksMsgRad >= NBMINUTEVEILLE)
-  {
-    // on set le flag pour envoyer le message radio
-    bTimeToSendRadioMsg = true;
-    // on reset le compteur
-    TicksMsgRad = 0;
-  }
-
-  // si le timer antiblocage moteur est lancé
-  if (TimeOutMoteur != 0)
-  {
-    // on décrémente le compteur
-    TimeOutMoteur--;
-    // Si le timer a expiré, on a du atteindre la position
-    if (TimeOutMoteur == 0)
-    {
-      // on stoppe les moteurs
-      digitalWrite(CMD_EXT, LOW);
-      digitalWrite(CMD_PC, LOW);
-    }
-  }
-}
 
 //----------------------------------------------------------------------
 //!\brief		Transmet les données du buffer radio
@@ -166,7 +133,7 @@ void SendRadioData(void)
 
   // conversion du float en INT x100
 
-  sprintf(payload, "$%s,%i\r\n", stNum, bretinfoporte);
+  sprintf(payload, "$%s,%d\r\n", stNum, nretinfoporte);
 
   // **************************************************
   // *	Emission des infos  sur la radio
@@ -258,12 +225,13 @@ void impulsion_relais(int duree)
 //----------------------------------------------------------------------
 int Trt_msg_GAR(char *message)
 {
+  Serial.println("--- Trt_msg_GAR ---");
   // Déclaration des variables
   char *entete, *i;
   // on dépouille le message reçu
   entete = strtok_r(message, ",", &i);
   nconsigne_porte = atoi(strtok_r(NULL, ",", &i));
-
+  
   return (1);
 }
 
@@ -286,6 +254,62 @@ void tache_gestion_radio(void)
 }
 
 //----------------------------------------------------------------------
+//!\brief           Fonction qui gère les consignes et impulsion 
+//----------------------------------------------------------------------
+void manage_door()
+{
+  // Serial.println("\t manage_door()");
+  // Si Timeout ouverture/fermeture porte est expiré
+  if (bflag_Timeout_door_expired == true)
+  {
+    Serial.println("\t bflag_Timeout_door_expired");
+    // Si la porte est en position fermée et que c'est la consigne demandée
+    if( (get_door_state() == DOOR_CLOSED) && (nconsigne_porte == DOOR_CLOSED))
+    {
+      // on passe la machine d'état dans l'état correspondant
+      SM_state = SM_WAIT_CLOSE;
+      // on resette le nb d'impulsions
+      ncpt_impulsion = 0;
+    }
+    // Si la porte est en position ouverte et que c'est la consigne demandée
+    else if ((get_door_state() == DOOR_OPENED) && (nconsigne_porte == DOOR_OPENED))
+    {
+      // on passe la machine d'état dans l'état correspondant
+      SM_state = SM_WAIT_OPEN;
+      // on resette le nb d'impulsions
+      ncpt_impulsion = 0;
+    }
+    // Sinon, c'est que la porte est dans un état intermédiaire ou bien en train de bouger.
+    else
+    {
+      // si on a déjà fait plus de 2 impulsions auparavent et que la porte n'est pas dans une position ouverte/fermée au bout du timetout, c'est que la porte est en erreur
+      if(ncpt_impulsion > 2)
+      {
+        Serial.println("\t ncpt_impulsion > 2");
+        SM_state = SM_ERROR;
+        ncpt_impulsion = 0;
+      }
+      else
+      {
+        Serial.println("\t impulsion_relais(500)");
+        // on genere un impulsion sur le relais qui pilote la porte de garage
+        impulsion_relais(500);
+        // armer le timer avec la durée d'ouverture/fermeture de la porte
+        TimeOutDoorMove = millis();
+        Serial.println("\t TimeOutDoorMove = millis();");
+        // reset du flag pour ne pas revenir ici systematiquement
+        bflag_Timeout_door_expired = false;
+        // on incremente le compteur d'impulsion
+        ncpt_impulsion++;
+        // attendre quelques secondes que l'aimant s'eloigne du capteur
+        delay(2000);
+      }
+    }
+  }
+}
+
+
+//----------------------------------------------------------------------
 //!\brief           Tache de fond qui gère la machine d'etat
 //----------------------------------------------------------------------
 void tache_gestion_SM(void)
@@ -300,13 +324,16 @@ void tache_gestion_SM(void)
     break;
 
   case SM_INIT:
+    Serial.println("--- SM_INIT ---");
     // rien a initialiser ???
-      SM_state = SM_WAIT;
+    SM_state = SM_WAIT;
     break;
 
   case SM_WAIT:
+    // Si on a recu un msg radio avec le bon entete
     if (TrtReceptRadio() == 1)
     {
+      Serial.println("--- SM_WAIT ---");
       // on execute la consigne du message recu
       Trt_msg_GAR(buffer_recept_rf12);
       // on passe a l'etat suivant
@@ -318,60 +345,40 @@ void tache_gestion_SM(void)
     break;
 
   case SM_ACTION:
-
-    if( nconsigne_porte == OPEN)
-    {
-      // si consigne ouverte
-      // regarder si porte n'est pas deja ouverte
-      // on genere un impulsion sur le relais qui pilote la porte de garage
-      impulsion_relais(1000);
-      // attendre quelques secondes que l'aimant s'eloigne du capteur
-      delay(2000);
-      // attendre quelques secondes que l'aimant s'eloigne du capteur
-      // armer timeout
-      // on passe a l'etat suivant
-      SM_state = SM_WAIT_OPEN;
-    }
-
-    if( nconsigne_porte == CLOSE)
-    {
-      // si consigne fermeture
-      // regarder si porte n'est pas deja ouverte
-      // agir sur GPIO
-      // on genere un impulsion sur le relais qui pilote la porte de garage
-      impulsion_relais(1000);
-      // attendre quelques secondes que l'aimant s'eloigne du capteur
-      delay(2000);
-      // armer timeout
-      // on passe a l'etat suivant
-      SM_state = SM_WAIT_CLOSE;
-    }
+    // Serial.println("--- SM_ACTION ---");
+    // on appelle la fonction qui gère l'application de la consigne
+    manage_door();
     break;
 
   case SM_WAIT_CLOSE:
+    Serial.println("--- SM_WAIT_CLOSE ---");
     // capteur fin de course CLOSE = true ?
     // si oui
     //  preparer buffer avec etat CLOSE
-    bretinfoporte = CLOSE;
+    nretinfoporte = DOOR_CLOSED;
     SM_state = SM_SEND_RADIO;
 
     break;
 
   case SM_WAIT_OPEN:
+    Serial.println("--- SM_WAIT_OPEN ---");
     // capteur fin de course OPEN = true ?
     // si oui
     //  preparer buffer avec etat OPEN
-    bretinfoporte = OPEN;
+    nretinfoporte = DOOR_OPENED;
     SM_state = SM_SEND_RADIO;
     break;
 
   case SM_ERROR:
+    Serial.println("--- SM_ERROR ---");
     // Erreur de timeout a l'ouverture ou fermeture
     // preparer buffer avec erreur
     SM_state = SM_SEND_RADIO;
     break;
 
   case SM_SEND_RADIO:
+    Serial.println("--- SM_SEND_RADIO ---");
+    nretinfoporte = DOOR_ERROR;
     SendRadioData();
     SM_state = SM_WAIT;
     break;
@@ -403,71 +410,28 @@ void status(void)
   }
 }
 
+door_state get_door_state(void)
+{
+  // si capteur fermeture = 1
+  // retourner DOOR_CLOSED
+
+  // si capteur fermeture = 1
+  // retourner DOOR_OPENED
+
+  // sinon
+  return DOOR_UNKNOWN_STATE;
+}
+
+
 //----------------------------------------------------------------------
 //!\brief           scheduler()
 //----------------------------------------------------------------------
 void tache_scheduler()
 {
-
-// 	if( (millis() - taskGetGPS) > PERIOD_GET_GPS){
-// 		taskGetGPS = millis();
-// 		MyFlag.taskGetGPS = true;	
-// 	}
-	
-// 	if( (millis() - taskTestGeof) > PERIOD_TEST_GEOFENCING){
-// 		taskTestGeof = millis();
-// 		MyFlag.taskTestGeof = true;
-// 	}
-	
-// 	if( (millis() - taskGetLiPo) > PERIOD_LIPO_INFO){
-// 		taskGetLiPo = millis();
-// 		MyFlag.taskGetLiPo = true;
-// 	}	
-	
-// 	if( (millis() - taskCheckSMS) > PERIOD_CHECK_SMS){
-// 		taskCheckSMS = millis();
-// 		MyFlag.taskCheckSMS = true;
-// 	}
-	
-// 	if( (millis() - taskAutoTestSMS) > PERIOD_AUTOTEST_SMS){
-// 		taskAutoTestSMS = millis();
-// 		SM_autotestsm = SMAT_START;
-// 	}	
-	
-// 	if( (millis() - taskCheckFlood) > PERIOD_CHECK_FLOOD){
-// 		taskCheckFlood = millis();
-// 		MyFlag.taskCheckFlood = true;
-// 	}	
-	
-// 	if( (millis() - taskStatusSMS) > PERIODIC_STATUS_SMS){
-// 		taskStatusSMS = millis();
-// 		MyFlag.taskStatusSMS = true;
-// 	}
-
-// 	if( (millis() - taskGetAnalog) > PERIOD_READ_ANALOG){
-// 		taskGetAnalog = millis();
-// 		MyFlag.taskGetAnalog = true;
-// 	}	
-
-// 	if( (millis() - taskCheckInputVoltage) > PERIOD_CHECK_ANALOG_LEVEL){
-// 		taskCheckInputVoltage = millis();
-// 		MyFlag.taskCheckInputVoltage = true;
-// 	}
-
-// 	if( ((millis() - TimeOutAutotestSMS) > TIMEOUT_AUTOTEST_SMS) && SM_autotestsm != SMAT_NOPE ){
-// 		Serial.println("--- Autotest SMS : Timeout , NO SMS received !! ---");
-// 		SM_autotestsm = SMAT_ERROR;
-// 	}
-	
-// 	if( ((millis() - IntervalAutotestSMS) > INTERVAL_AUTOTEST_SMS) && SM_autotestsm == SMAT_RETRYSMS ){
-// 		Serial.println("--- Autotest SMS : Interval autotest SMS expired ---");
-// 		MyFlag.flagIntervalAutotestSMS = true;
-// 	}
-	
-// 	if( ((millis() - TimeOutSMSMenu) > TIMEOUT_SMS_MENU) && MySMS.menupos != SM_LOGIN && MySMS.menupos != SM_AUTOTEST_SMS ){
-// 		MySMS.menupos = SM_LOGIN;
-// 		Serial.println("--- SMS Menu manager : Timeout ---");
-// 	}
+	if( ((millis() - TimeOutDoorMove) > TIMEOUT_DOOR_MOVE) && SM_state == SM_ACTION){
+		Serial.println("--- Timeout Door Move ---");
+		bflag_Timeout_door_expired = true;
+	}
 }
 
 //----------------------------------------------------------------------
@@ -501,12 +465,13 @@ void setup()
   rf12_control(0xC6A3);
   Serial.print("\nInit Radio : \n 1200 bauds\n");
 
-  // Configuration d'un timer d'une seconde qui sert de scheduler
-  MsTimer2::set(100, Timer100ms); // ms periode -> 1 seconde
-  MsTimer2::start();
+  // Initialisaiton des timers
+   TimeOutDoorMove = millis();
 
-  /* initialize state machine*/
-  SM_state = SM_INIT;
+/* initialize door state*/
+  Door_State = DOOR_UNKNOWN_STATE;
+
+  Door_State = get_door_state();
 
   Serial.println("\nFin SETUP");
   clignote_led();
