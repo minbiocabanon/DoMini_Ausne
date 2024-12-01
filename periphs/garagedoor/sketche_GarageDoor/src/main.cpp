@@ -29,18 +29,19 @@ char stNum[] = "GARL";
 #define RADIO_WAKEUP -1
 
 // Declation des variables pour les GPIO
-#define CMD_EXT 4   // Commande Bypass vers Ext sur PD5 - Pin11
-#define CMD_PC 5    // Commande Bypass vers Ext sur PD4 - Pin6
-#define CMD_VMCDF 7 // Commande Bypass vers Ext sur PD7 - Pin13
-#define INFO_PC 17  // Commande Bypass vers Ext sur PC4 - Pin27
-#define INFO_EXT 26 // FAUX			// Commande Bypass vers Ext sur PC3 - Pin26
+#define RELAY 4           // Commande Relais qui ouvrer/ferme la porte de garage sur PD4 - Pin6
+#define SPARE_14 14       // Commande du 2eme Relais PC0 - Pin23
+
+#define IN_DOOR_OPEN 5    // Entrée capteur magnétique pour porte ouverte sur PD5 - Pin11
+#define IN_DOOR_CLOSE 15  // Entrée capteur magnétique pour porte fermée sur PC1 - Pin24
+
 #define CLOSE 0
 #define OPEN 1
 
 // Declaration des durées des timers / timeout
 #define TIMEOUT_DOOR_MOVE			30000		// 30sec in milliseconds. A expiration, la machine d'état vérifie l'état de la porte
 
-#define RELAY 4 // Commande Relais qui ouvrer/ferme la porte de garage sur PD4 - Pin6
+
 
 enum state_machine_t
 {
@@ -75,9 +76,9 @@ int TrtReceptRadio(void);
 void clignote_led(void);
 void tache_scheduler();
 void tache_gestion_SM(void);
-void status();
+void status(void);
 door_state get_door_state(void);
-void manage_door();
+void manage_door(void);
 
 // variable pour timer
 unsigned long TimeOutDoorMove = 0;
@@ -211,6 +212,7 @@ int TrtReceptRadio(void)
 //----------------------------------------------------------------------
 void impulsion_relais(int duree)
 {
+  Serial.println(">> Generating impulsion << ");
   // on active le relay qui pilote la porte de garage
   digitalWrite(RELAY, HIGH);
   delay(duree);
@@ -241,9 +243,10 @@ int Trt_msg_GAR(char *message)
 void tache_gestion_radio(void)
 {
 
-  // si le message radio est correcte -> message radio ($GAR L/)   ET que l'utilisateur n'est pas en train de trifouiller les boutons . on ne traite pas la consigne reçu par radio si l'utilisateur s'apprete à changer la consigne (passage en mode manuel)
+  // si le message radio est correcte -> message radio ($GAR L/)
   if (TrtReceptRadio() == 1)
   {
+    Serial.println("Envoi msg radio...");
     // on execute la consigne du message recu
     Trt_msg_GAR(buffer_recept_rf12);
     // on indique qu'une consigne est à traiter
@@ -258,13 +261,15 @@ void tache_gestion_radio(void)
 //----------------------------------------------------------------------
 void manage_door()
 {
-  // Serial.println("\t manage_door()");
   // Si Timeout ouverture/fermeture porte est expiré
   if (bflag_Timeout_door_expired == true)
   {
     Serial.println("\t bflag_Timeout_door_expired");
-    // Si la porte est en position fermée et que c'est la consigne demandée
-    if( (get_door_state() == DOOR_CLOSED) && (nconsigne_porte == DOOR_CLOSED))
+
+    door_state doorstate = get_door_state();
+
+    // Si la porte est en position fermée et que cet état correspond à consigne demandée
+    if( (doorstate == DOOR_CLOSED) && (nconsigne_porte == DOOR_CLOSED))
     {
       // on passe la machine d'état dans l'état correspondant
       SM_state = SM_WAIT_CLOSE;
@@ -272,7 +277,7 @@ void manage_door()
       ncpt_impulsion = 0;
     }
     // Si la porte est en position ouverte et que c'est la consigne demandée
-    else if ((get_door_state() == DOOR_OPENED) && (nconsigne_porte == DOOR_OPENED))
+    else if ((doorstate == DOOR_OPENED) && (nconsigne_porte == DOOR_OPENED))
     {
       // on passe la machine d'état dans l'état correspondant
       SM_state = SM_WAIT_OPEN;
@@ -283,6 +288,14 @@ void manage_door()
     else
     {
       // si on a déjà fait plus de 2 impulsions auparavent et que la porte n'est pas dans une position ouverte/fermée au bout du timetout, c'est que la porte est en erreur
+      // rappel sur le fonctionnement du controleur de la porte de garage :
+      // Une impulsion permet de  :
+      //    - Ouvrir la porte si elle est fermée.
+      //    - Fermer la porte si elle est ouverte.
+      //    - Stoppe la porte si elle en train de s'ouvrir ou de se fermer.
+      //    - Change de sens si elle est arrêtée entre deux états.
+      //
+      //  Par conséquent, avec 3 impulsions max on doit retrouver un état connu.
       if(ncpt_impulsion > 2)
       {
         Serial.println("\t ncpt_impulsion > 2");
@@ -291,12 +304,12 @@ void manage_door()
       }
       else
       {
-        Serial.println("\t impulsion_relais(500)");
-        // on genere un impulsion sur le relais qui pilote la porte de garage
+        Serial.println("Impulsion_relais(500)");
+        // on genere une impulsion sur le relais qui pilote la porte de garage
         impulsion_relais(500);
         // armer le timer avec la durée d'ouverture/fermeture de la porte
         TimeOutDoorMove = millis();
-        Serial.println("\t TimeOutDoorMove = millis();");
+        Serial.println(" TimeOutDoorMove = millis();");
         // reset du flag pour ne pas revenir ici systematiquement
         bflag_Timeout_door_expired = false;
         // on incremente le compteur d'impulsion
@@ -378,7 +391,6 @@ void tache_gestion_SM(void)
 
   case SM_SEND_RADIO:
     Serial.println("--- SM_SEND_RADIO ---");
-    nretinfoporte = DOOR_ERROR;
     SendRadioData();
     SM_state = SM_WAIT;
     break;
@@ -410,16 +422,35 @@ void status(void)
   }
 }
 
+//----------------------------------------------------------------------
+//!\brief         Retourne l'état de la porte
+//!\return        type door_state
+//----------------------------------------------------------------------
 door_state get_door_state(void)
 {
-  // si capteur fermeture = 1
-  // retourner DOOR_CLOSED
 
-  // si capteur fermeture = 1
-  // retourner DOOR_OPENED
+  Serial.println("lecture infos capteurs");
+  // lecture des deux capteurs
+  int ncpt_close = digitalRead(IN_DOOR_CLOSE);
+  int ncpt_open = digitalRead(IN_DOOR_OPEN);
 
-  // sinon
-  return DOOR_UNKNOWN_STATE;
+  Serial.print("\t npt_close : ");
+  Serial.println(ncpt_close);
+  Serial.print("\t ncpt_open : ");
+  Serial.println(ncpt_open);
+
+  // gestion des 4 combinaisons possibles
+  // attention logique inverse : GPIO avec PU interne , le capteur fait une mise à la masse.
+  if (ncpt_close == 0 && ncpt_open == 1)
+    return DOOR_CLOSED;
+  else if (ncpt_close == 1 && ncpt_open == 0 )
+    return DOOR_OPENED;
+  else if (ncpt_close == 0 && ncpt_open == 0)
+    return DOOR_ERROR;
+  else if (ncpt_close == 1 && ncpt_open == 1)
+    return  DOOR_UNKNOWN_STATE;
+  else
+    return DOOR_ERROR;
 }
 
 
@@ -429,7 +460,7 @@ door_state get_door_state(void)
 void tache_scheduler()
 {
 	if( ((millis() - TimeOutDoorMove) > TIMEOUT_DOOR_MOVE) && SM_state == SM_ACTION){
-		Serial.println("--- Timeout Door Move ---");
+		Serial.println("--- Timeout Door move ---");
 		bflag_Timeout_door_expired = true;
 	}
 }
@@ -448,11 +479,14 @@ void setup()
   Serial.println(stNum);
 
   // config des GPIO
-  //  pinMode(CMD_EXT, OUTPUT);
-  //  pinMode(CMD_PC, OUTPUT);
-  //  pinMode(CMD_VMCDF, OUTPUT);
-  //  pinMode(INFO_PC, INPUT);
+  //configure pin 2 as an input and enable the internal pull-up resistor
+
+  pinMode(IN_DOOR_CLOSE, INPUT_PULLUP);
+  pinMode(IN_DOOR_OPEN, INPUT_PULLUP);
   pinMode(RELAY, OUTPUT);
+  digitalWrite(RELAY, LOW);
+  pinMode(SPARE_14, INPUT);
+  digitalWrite(SPARE_14, LOW);
   pinMode(LED, OUTPUT);
 
   // TEST
@@ -491,3 +525,4 @@ void loop()
 
   delay(10);
 }
+
